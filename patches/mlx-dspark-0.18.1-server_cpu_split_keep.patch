@@ -1,0 +1,12 @@
+--- a/src/mlx_dspark/server.py
++++ b/src/mlx_dspark/server.py
+@@ -835,6 +835,9 @@
+         flip is the process-wide ``generate.CPU_SPLIT`` (read at each prefill's entry), so
+         the next prefill is GPU-only; a hot swap or ``/admin/load cpu_split`` re-arms it."""
+         from . import generate as _gen
++        from .wide_gemm import CPU_SPLIT_FP32   # local patch: the fp32 BLAS route does not hit the BNNS crash (#31),
++        if CPU_SPLIT_FP32 and os.environ.get("MLX_DSPARK_CPU_SPLIT_SUSPEND", "0") != "1":   # so keep co-prefill on
++            return {"cpu_split": "kept (fp32 BLAS route)"}
+ 
+         if _gen.CPU_SPLIT is None or self.cpu_split_suspended is not None:
+             return {}

@@ -1,0 +1,397 @@
+--- a/src/mlx_dspark/prefix_cache.py
++++ b/src/mlx_dspark/prefix_cache.py
+@@ -67,6 +67,9 @@
+ 
+ import contextlib
+ import glob
++import re
++import threading
++import time
+ import json
+ import os
+ 
+@@ -237,7 +240,7 @@
+     positions where the non-trimmable layer states were captured, enabling partial reuse
+     below the boundary (trimmable layers come from ``snapshot`` trimmed back)."""
+ 
+-    __slots__ = ("cache", "ctx", "nontrim", "rungs", "sid", "snapshot", "spilled", "tokens")
++    __slots__ = ("cache", "ctx", "nontrim", "rungs", "sid", "snapshot", "spilled", "superseded", "tokens")
+ 
+     def __init__(self, tokens, cache, ctx, sid: int, snapshot=None, rungs=None,
+                  nontrim=None):
+@@ -249,12 +252,14 @@
+         self.snapshot = snapshot      # not None => checkpoint slot
+         self.rungs: dict = rungs or {}   # pos -> [(layer_idx, state, meta_state)]
+         self.nontrim: list[int] = nontrim or []   # layer idxs non-trimmable at snapshot time
++        self.superseded: list[int] = []           # sids whose files this slot's persist replaces
+ 
+ 
+ class PrefixCache:
+     def __init__(self, make_cache, make_ctx=None, *, min_reuse: int = 16,
+                  l2_dir: str | None = None, max_ram_bytes: int = 0, slots: int = 2,
+-                 checkpoint: bool = False, max_rungs: int = 8):
++                 checkpoint: bool = False,
++                 max_rungs: int = int(os.environ.get("MLX_DSPARK_MAX_RUNGS", "12"))):
+         self.make_cache = make_cache          # () -> list[target layer cache]
+         self.make_ctx = make_ctx              # () -> list[CtxCache] | None (None for baseline)
+         self.min_reuse = max(1, min_reuse)
+@@ -273,9 +278,38 @@
+         self._anchor = 0                      # LCP the server should snapshot at (see acquire)
+         if l2_dir:
+             os.makedirs(l2_dir, exist_ok=True)
++        # Local patch (2026-09-04, Hermes audit): persist CHECKPOINT slots (hybrid/recurrent
++        # targets) to ``l2_dir`` so a fixed agent system prompt and the last conversations
++        # survive a server restart. Upstream spills only trim slots. Files: ckpt_<sid>.safetensors.
++        # Disable with MLX_DSPARK_CKPT_PERSIST=0.
++        self.persist_ckpt = bool(l2_dir) and os.environ.get("MLX_DSPARK_CKPT_PERSIST", "1") != "0"
++        # Slot policy: prompts shorter than this never take a checkpoint slot. With a 2-slot
++        # LRU, two unrelated short requests (a title/summary call, a warm-up ping) otherwise
++        # evict two 30k-token conversations that cost ~200 s each to rebuild; a sub-1k prompt
++        # re-prefills in a few seconds.
++        self.min_slot_tokens = max(0, int(os.environ.get("MLX_DSPARK_CKPT_MIN_TOKENS", "1024")))
++        self._persist_lock = threading.Lock()
++        self._load_thread = None
++        if self.persist_ckpt:
++            # Off the constructor's critical path: the server warms the model up while the
++            # persisted slots are read and materialized; every consumer joins first (_ready).
++            self._load_thread = threading.Thread(target=self._load_persisted, daemon=True,
++                                                 name="prefix-ckpt-load")
++            self._load_thread.start()
+ 
+     # -- public API (engine calls these under its generation lock) --
++    def _ready(self) -> None:
++        t = getattr(self, "_load_thread", None)
++        if t is not None and t.is_alive() and t is not threading.current_thread():
++            t.join()
++
+     def acquire(self, prompt_ids: list[int]):
++        self._ready()
++        if not self._slots and self.persist_ckpt and self.l2_dir and self.checkpoint_mode:
++            # RAM slots are empty (fresh process before the loader ran, or a CRITICAL memory
++            # shed emptied them): bring back just the persisted slot that serves THIS prompt
++            # best, not the whole set — a critical Mac should not get 3 slots re-materialized.
++            self._load_best_persisted(prompt_ids)
+         """Return ``(cache, ctx, reuse_len)`` for this request — the best-matching slot's
+         caches trimmed to the shared prefix, or fresh ones. A trim slot is checked out
+         (removed) until ``store()`` re-validates it; checkpoint slots are never checked out
+@@ -315,6 +349,19 @@
+                         return (self.make_cache(),
+                                 (self.make_ctx() if self.make_ctx else None), 0)
+                     self.partial_hits += 1
++                    # Inherit the whole ladder at/below the rung we restored from: the slot this
++                    # request checkpoints then carries it too (shared, evaluated arrays — no RAM
++                    # beyond references; measured: without this a conversation started from the
++                    # static-prefix anchor held rungs only above 18,942 of 22,693 tokens, so once
++                    # the priming slots were evicted any divergence below the anchor — a new
++                    # day's date line, a memory edit, a project switch — was a full cold prefill),
++                    # so a divergence anchor (e.g. the end of a static system+tools prefix)
++                    # survives the LRU evicting the slot that first planted it. Without this
++                    # a conversation started from the anchor has no rung below its own
++                    # boundary and later new sessions fall back to a cold prefill.
++                    for r, cap in best.rungs.items():
++                        if r <= best_rung:              # every rung at/below the restore point is
++                            self._pending_rungs.setdefault(r, list(cap))   # a valid prefix state
+                 self._slots.remove(best)
+                 self._slots.insert(0, best)          # LRU touch
+                 self.hits += 1
+@@ -358,8 +405,9 @@
+         construction: the loops split prefill at the server's marks. Absorbs this prefill's
+         staged rungs, and collapses any older slot whose boundary this prompt extends into a
+         rung of the new slot (one slot per conversation, with a ladder of past boundaries)."""
++        self._ready()
+         pending, self._pending_rungs = self._pending_rungs, {}
+-        if not self.checkpoint_mode or n_prompt < self.min_reuse:
++        if not self.checkpoint_mode or n_prompt < self.min_reuse or n_prompt < self.min_slot_tokens:
+             return
+         tokens = list(prompt_ids[:n_prompt])
+         rungs = {r: cap for r, cap in pending.items() if self.min_reuse <= r < n_prompt}
+@@ -369,6 +417,7 @@
+                 self._cap_rungs(slot)
+                 return
+         nontrim = [i for i, c in enumerate(cache) if not _layer_trimmable(c)]
++        superseded: list[int] = []
+         for old in [s for s in self._slots
+                     if s.snapshot is not None and len(s.tokens) < n_prompt
+                     and tokens[:len(s.tokens)] == s.tokens]:
+@@ -381,15 +430,26 @@
+                 snap, _ = old.snapshot
+                 rungs[b] = [(i, snap[i][0], snap[i][1]) for i in old.nontrim]
+             self._slots.remove(old)
++            superseded.append(old.sid)           # file removed once the replacement is on disk
+         slot = _Slot(tokens, None, None, self._next_sid, snapshot=_snapshot(cache, ctx),
+                      rungs=rungs, nontrim=nontrim)
++        slot.superseded = superseded
+         self._next_sid += 1
+         self._slots.insert(0, slot)
+         self._cap_rungs(slot)
+         while len(self._slots) > self.max_slots:
+             self._evict(self._slots.pop())
++        if self.persist_ckpt:
++            # non-daemon: a SIGTERM'd server (idle unload, image hand-off) finishes the write
++            # (0.4-2.5 s) before the interpreter exits instead of leaving a torn checkpoint.
++            threading.Thread(target=self._persist_checkpoint, args=(slot,), daemon=False,
++                             name="prefix-ckpt-persist").start()
++        else:
++            for sid in superseded:
++                self._remove_ckpt_file(sid)
+ 
+     def store(self, cache, ctx, prompt_ids: list[int], token_ids: list[int]) -> None:
++        self._ready()
+         # the cache holds KV for the prompt + every generated token EXCEPT the last (that one is
+         # the pending token, not yet fed through the target) — see the generate loops.
+         if not _storable(cache):              # e.g. a RotatingKVCache wrapped mid-generation
+@@ -422,10 +482,15 @@
+         self._maybe_spill()
+ 
+     def reset(self) -> None:
++        self._ready()
+         self._slots = []
+         self._pending_rungs = {}
+         self._anchor = 0
+         self._clear_spill_files()
++        if getattr(self, "persist_ckpt", False):
++            # A failed generation only desyncs in-flight RAM state; the persisted boundary
++            # checkpoints were written from settled states, so re-attach them (lazy, file-backed).
++            self._load_persisted()
+ 
+     def shed(self, level: str = "warn") -> dict:
+         """Give memory back under OS pressure (see :mod:`~mlx_dspark.memory_guard`).
+@@ -439,6 +504,7 @@
+         the generation thread; a slot an in-flight request already acquired is not in
+         ``_slots`` (acquire removes it; ``store`` re-validates), so nothing live is touched.
+         """
++        self._ready()
+         def slot_bytes(s) -> int:
+             if s.snapshot is not None:
+                 return _snapshot_ram_bytes(s.snapshot) + _rung_ram_bytes(s.rungs)
+@@ -448,20 +514,30 @@
+         slots_before = len(self._slots)
+         rungs_before = sum(len(s.rungs) for s in self._slots)
+         if level == "critical":
+-            self.reset()
+-            action = "emptied"
++            self._slots = []
++            self._pending_rungs = {}
++            self._anchor = 0
++            self._clear_spill_files()
++            # persisted checkpoint files are left on disk (re-attached at the next start or
++            # exception reset); re-loading them here would defeat the point of shedding RAM.
++            action = "emptied (persisted checkpoints kept on disk for the next start)"
+         else:
+-            for s in self._slots:
+-                s.rungs = {}
++            # WARN: keep the ladders. Upstream dropped every slot's rungs here (~130 MB each on
++            # this hybrid), but on this deployment the rungs ARE the reuse: they carry the
++            # static-prefix anchors every new session restores from. Measured 2026-09-05: one
++            # WARN shed during a priming run wiped all rungs and the next new session paid a
++            # full 130 s cold prefill. The allocator cache the guard clears right after this
++            # (1.3 GB) is what actually relieves pressure; CRITICAL still empties everything.
+             self._pending_rungs = {}
+             self._anchor = 0
+-            action = "rungs dropped, slots kept"
++            action = "ladders kept (allocator cache cleared)"
+         after = sum(slot_bytes(s) for s in self._slots)
+         return {"action": action, "prefix_bytes_freed": max(before - after, 0),
+                 "slots_dropped": slots_before - len(self._slots),
+                 "rungs_dropped": rungs_before - sum(len(s.rungs) for s in self._slots)}
+ 
+     def info(self) -> dict:
++        self._ready()
+         newest = self._slots[0] if self._slots else None
+         return {"enabled": True,
+                 "mode": "checkpoint" if self.checkpoint_mode else "trim",
+@@ -472,7 +548,9 @@
+                           for s in self._slots],
+                 "hits": self.hits, "partial_hits": self.partial_hits,
+                 "reused_tokens": self.reused_tokens,
+-                "l2": bool(self.l2_dir)}
++                "l2": bool(self.l2_dir),
++                "persist_ckpt": bool(getattr(self, "persist_ckpt", False)),
++                "min_slot_tokens": int(getattr(self, "min_slot_tokens", 0))}
+ 
+     # -- internals --
+     def _restore_rung(self, slot: _Slot, r: int):
+@@ -518,7 +596,183 @@
+         for p in self._spill_paths(slot.sid):
+             with contextlib.suppress(OSError):
+                 os.remove(p)
++        self._remove_ckpt_file(slot.sid)
++
++    # -- persisted checkpoint slots (local patch) --
++    def _ckpt_path(self, sid: int) -> str:
++        return os.path.join(self.l2_dir, f"ckpt_{sid}.safetensors")
++
++    def _remove_ckpt_file(self, sid: int) -> None:
++        if self.l2_dir:
++            with contextlib.suppress(OSError):
++                os.remove(self._ckpt_path(sid))
++
++    @staticmethod
++    def _meta_json(meta):
++        try:
++            json.dumps(meta)
++            return meta
++        except TypeError:
++            return None
++
++    def _persist_checkpoint(self, slot: _Slot) -> None:
++        """Serialize a checkpoint slot (boundary snapshot + rungs) to ``l2_dir``. Runs in a
++        background thread; the snapshot arrays are already materialized copies."""
++        try:
++            with self._persist_lock:
++                snap, snap_ctx = slot.snapshot
++                arrays, layers = {}, []
++                for i, (state, meta) in enumerate(snap):
++                    items = list(state) if isinstance(state, (list, tuple)) else [state]
++                    kinds = []
++                    for j, a in enumerate(items):
++                        if isinstance(a, mx.array):
++                            arrays[f"l{i}_s{j}"] = a
++                            kinds.append("a")
++                        else:
++                            kinds.append("n")
++                    layers.append({"n": len(items), "kinds": kinds,
++                                   "tuple": isinstance(state, tuple), "meta": self._meta_json(meta)})
++                rungs = {}
++                for pos, cap in slot.rungs.items():
++                    entries = []
++                    for (i, st, meta) in cap:
++                        items = list(st) if isinstance(st, (list, tuple)) else [st]
++                        kinds = []
++                        for j, a in enumerate(items):
++                            if isinstance(a, mx.array):
++                                arrays[f"r{pos}_l{i}_s{j}"] = a
++                                kinds.append("a")
++                            else:
++                                kinds.append("n")
++                        entries.append({"i": i, "n": len(items), "kinds": kinds,
++                                        "tuple": isinstance(st, tuple), "meta": self._meta_json(meta)})
++                    rungs[str(pos)] = entries
++                ctx_n = 0
++                if snap_ctx:
++                    for i, (k, v) in enumerate(snap_ctx):
++                        arrays[f"c{i}_k"], arrays[f"c{i}_v"] = k, v
++                    ctx_n = len(snap_ctx)
++                meta = {"version": "1", "tokens": json.dumps(slot.tokens), "layers": json.dumps(layers),
++                        "rungs": json.dumps(rungs), "nontrim": json.dumps(slot.nontrim), "ctx_n": str(ctx_n)}
++                # NOTE: no `mx.stream(mx.cpu)` here — MLX's default stream is process-global,
++                # so a stream context in this thread would schedule every op the serving
++                # thread builds meanwhile onto the CPU (measured: a 27B 6-bit matmul stall of
++                # minutes). The snapshot arrays are already materialized; this is pure I/O.
++                # save_safetensors appends ".safetensors" to names lacking it, so the temp
++                # name must already end with it and must not match the ckpt_* load glob.
++                t0 = time.perf_counter()
++                tmp = self._tmp_path(slot.sid)
++                mx.save_safetensors(tmp, arrays, meta)
++                os.replace(tmp, self._ckpt_path(slot.sid))
++                size = os.path.getsize(self._ckpt_path(slot.sid))
++                for sid in getattr(slot, "superseded", ()):
++                    self._remove_ckpt_file(sid)      # only now: a kill mid-write keeps the older file
++                self._prune_ckpt_files()
++                print(f"[prefix-cache] persisted checkpoint slot {slot.sid} ({len(slot.tokens)} tokens, "
++                      f"{size / 1e9:.2f} GB) in {time.perf_counter() - t0:.1f}s", flush=True)
++        except Exception as e:  # never let persistence break serving
++            with contextlib.suppress(OSError):
++                os.remove(self._tmp_path(slot.sid))
++            print(f"[prefix-cache] checkpoint persist failed for slot {slot.sid}: {e!r}", flush=True)
+ 
++    def _prune_ckpt_files(self) -> None:
++        """Delete checkpoint files of slots that are no longer held (evicted/superseded while a
++        shed or reset had detached them), bounding disk use to the live slots."""
++        live = {s.sid for s in self._slots}
++        for s in self._slots:                    # files a live slot's pending persist still replaces
++            live.update(getattr(s, "superseded", ()))
++        for path in glob.glob(os.path.join(self.l2_dir, "ckpt_*.safetensors")):
++            m = re.fullmatch(r"ckpt_(\d+)\.safetensors", os.path.basename(path))
++            if m and int(m.group(1)) not in live:
++                with contextlib.suppress(OSError):
++                    os.remove(path)
++
++    def _tmp_path(self, sid: int) -> str:
++        return os.path.join(self.l2_dir, f"tmp-ckpt_{sid}.safetensors")
++
++    def _persisted_files(self) -> list[str]:
++        for stale in glob.glob(os.path.join(self.l2_dir, "tmp-ckpt_*.safetensors")):
++            with contextlib.suppress(OSError):
++                os.remove(stale)                     # an interrupted write
++        return sorted((p for p in glob.glob(os.path.join(self.l2_dir, "ckpt_*.safetensors"))
++                       if re.fullmatch(r"ckpt_\d+\.safetensors", os.path.basename(p))),
++                      key=os.path.getmtime, reverse=True)
++
++    def _load_best_persisted(self, prompt_ids: list[int]) -> None:
++        """Materialize the one persisted slot with the longest usable common prefix for
++        ``prompt_ids`` (metadata scan only for the others). No-op when nothing matches."""
++        best, best_len = None, 0
++        for path in self._persisted_files():
++            try:
++                _, meta = mx.load(path, return_metadata=True)
++                if meta.get("version") != "1":
++                    continue
++                tokens = json.loads(meta["tokens"])
++                lcp = _lcp(tokens, prompt_ids)
++                rungs = [int(r) for r in json.loads(meta.get("rungs", "{}"))]
++                usable = (len(tokens) if lcp >= len(tokens) and len(prompt_ids) > len(tokens)
++                          else max((r for r in rungs if self.min_reuse <= r <= lcp), default=0))
++                if usable > best_len:
++                    best, best_len = path, usable
++            except Exception as e:
++                print(f"[prefix-cache] could not read persisted checkpoint {path}: {e!r}", flush=True)
++        if best is not None and best_len >= self.min_reuse:
++            self._load_persisted(only=[best])
++
++    def _load_persisted(self, only: list[str] | None = None) -> None:
++        """Rebuild checkpoint slots from ``l2_dir`` (lazy, file-backed arrays: no RAM until a
++        hit copies them). Newest files first; anything beyond ``max_slots`` is deleted."""
++        paths = self._persisted_files() if only is None else list(only)
++        loaded = len(self._slots) if only is not None else 0
++        for path in paths:
++            if loaded >= self.max_slots:
++                if only is None:
++                    with contextlib.suppress(OSError):
++                        os.remove(path)
++                continue
++            if any(s.sid == int(os.path.basename(path)[len("ckpt_"):-len(".safetensors")])
++                   for s in self._slots):
++                continue                             # already attached
++            try:
++                sid = int(os.path.basename(path)[len("ckpt_"):-len(".safetensors")])
++                arrays, meta = mx.load(path, return_metadata=True)
++                if meta.get("version") != "1":
++                    continue
++                # Materialize now: MLX 0.32 binds lazy ops (incl. file loads) to the creating
++                # thread's streams ("There is no Stream(cpu, N) in current thread" when another
++                # thread evaluates them). Evaluated arrays are usable from any request thread,
++                # and steady state holds these slots in RAM anyway (2-3 GB per 30k-token slot).
++                mx.eval(list(arrays.values()))
++                tokens = json.loads(meta["tokens"])
++                layers = json.loads(meta["layers"])
++                snap = []
++                for i, lm in enumerate(layers):
++                    items = [arrays.get(f"l{i}_s{j}") if k == "a" else None for j, k in enumerate(lm["kinds"])]
++                    state = tuple(items) if lm["tuple"] else items
++                    snap.append((state, lm.get("meta")))
++                rungs = {}
++                for pos, entries in json.loads(meta.get("rungs", "{}")).items():
++                    cap = []
++                    for e in entries:
++                        items = [arrays.get(f"r{pos}_l{e['i']}_s{j}") if k == "a" else None
++                                 for j, k in enumerate(e["kinds"])]
++                        st = tuple(items) if e["tuple"] else items
++                        cap.append((e["i"], st, e.get("meta")))
++                    rungs[int(pos)] = cap
++                ctx_n = int(meta.get("ctx_n", "0") or 0)
++                snap_ctx = [(arrays[f"c{i}_k"], arrays[f"c{i}_v"]) for i in range(ctx_n)] or None
++                slot = _Slot(tokens, None, None, sid, snapshot=(snap, snap_ctx), rungs=rungs,
++                             nontrim=json.loads(meta.get("nontrim", "[]")))
++                self._slots.append(slot)
++                self._next_sid = max(self._next_sid, sid + 1)
++                loaded += 1
++            except Exception as e:
++                print(f"[prefix-cache] could not load persisted checkpoint {path}: {e!r}", flush=True)
++        if loaded:
++            print(f"[prefix-cache] restored {loaded} persisted checkpoint slot(s) from {self.l2_dir} "
++                  f"(tokens: {[len(s.tokens) for s in self._slots]})", flush=True)
++
+     def _maybe_spill(self) -> None:
+         if self.max_ram_bytes <= 0 or not self.l2_dir:
+             return

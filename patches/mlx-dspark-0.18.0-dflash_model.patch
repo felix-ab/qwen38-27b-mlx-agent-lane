@@ -1,0 +1,19 @@
+--- a/src/mlx_dspark/dflash_model.py
++++ b/src/mlx_dspark/dflash_model.py
+@@ -146,6 +146,16 @@
+         ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+         ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+         ctx_keys = rope(ctx_keys, offset=cache.offset)
++        if S == 1 and isinstance(cache, RotatingKVCache):
++            held = 0 if cache.keys is None else int(cache.keys.shape[2])
++            if held < cache.max_size and cache.offset != held:
++                # A prefix-cache restore presets ``offset`` to the window's ABSOLUTE start
++                # (rope positions), so on a not-yet-full buffer offset != rows held.
++                # mlx-lm's single-row in-place path sizes its growth and write index from
++                # ``offset`` (valid only while offset == rows) -> "Negative dimensions"
++                # once offset > max_size. The concat path indexes by rows held and is
++                # exact for a non-full buffer; the in-place rotation resumes once full.
++                return cache._update_concat(ctx_keys, ctx_values)
+         return cache.update_and_fetch(ctx_keys, ctx_values)
+ 
+     def __call__(self, x, x_ctx, rope, cache):

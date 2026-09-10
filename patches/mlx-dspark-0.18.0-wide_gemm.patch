@@ -1,0 +1,46 @@
+--- a/src/mlx_dspark/wide_gemm.py
++++ b/src/mlx_dspark/wide_gemm.py
+@@ -72,6 +72,9 @@
+ import time
+ 
+ import mlx.core as mx
++
++import os as _os
++CPU_SPLIT_FP32 = _os.environ.get("MLX_DSPARK_CPU_SPLIT_FP32", "1") != "0"   # see _split_call
+ import mlx.nn as nn
+ 
+ _orig_call = nn.QuantizedLinear.__call__
+@@ -143,8 +146,17 @@
+                       group_size=self.group_size, bits=self.bits)
+     lead = x.shape[:-1]
+     x2 = x.reshape(rows, x.shape[-1])
+-    with mx.stream(mx.cpu):
+-        y_cpu = x2[:n_cpu] @ w.T
++    if CPU_SPLIT_FP32:
++        # float32 on the CPU: mlx routes fp32 GEMMs to Accelerate BLAS (sgemm), bf16/fp16 ones
++        # to BNNS — the library that SIGSEGV'd mid-prefill on this M4 Pro (2026-09-04, and
++        # issue #31). Widening happens on the GPU stream; the CPU reads fp32 operands and the
++        # result is rounded back once. Same exact products, fp32 accumulation as before.
++        w32 = w.astype(mx.float32)
++        with mx.stream(mx.cpu):
++            y_cpu = (x2[:n_cpu].astype(mx.float32) @ w32.T).astype(x.dtype)
++    else:
++        with mx.stream(mx.cpu):
++            y_cpu = x2[:n_cpu] @ w.T
+     y_gpu = x2[n_cpu:] @ w.T
+     y = mx.concatenate([y_cpu, y_gpu], axis=0)
+     if "bias" in self:
+@@ -409,6 +421,13 @@
+         def split(a, frac):
+             wd = mx.dequantize(w, s, b, group_size=gs, bits=bits)
+             n = cpu_rows(a.shape[0], frac)
++            if CPU_SPLIT_FP32:                      # calibrate the path that actually runs
++                wd32 = wd.astype(mx.float32)
++                y1 = None
++                with mx.stream(mx.cpu):
++                    y1 = (a[:n].astype(mx.float32) @ wd32.T).astype(a.dtype)
++                y0 = a[n:] @ wd.T
++                return mx.concatenate([y1, y0], axis=0)
+             y0 = a[:-n] @ wd.T
+             with mx.stream(mx.cpu):
+                 y1 = a[-n:] @ wd.T

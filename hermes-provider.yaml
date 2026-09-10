@@ -1,0 +1,19 @@
+# Hermes Agent (0.21.x) provider block for the local lane. Adapt names to your config; the settings are the point:
+# thinking on at medium effort, Qwen's official thinking sampler, 65k context, 4k completion cap (the budget-forcing
+# proxy handles the case where thinking eats the whole cap), reasoning replay left OFF (measured: hurts late retention,
+# doubles context, -18 % speed).
+providers:
+  custom:local-qwen:
+    base_url: http://127.0.0.1:8084/v1        # the proxy (or 8044 for the bare backend)
+    models:
+      - qwen3.8-27b-orcarouter-uncensored-6bit
+model:
+  provider: custom:local-qwen
+  default: qwen3.8-27b-orcarouter-uncensored-6bit
+  reasoning_effort: medium
+  # reasoning_echo: false   (default; leave it)
+  models:
+    qwen3.8-27b-orcarouter-uncensored-6bit:
+      context_length: 65536
+      max_tokens: 4096
+# sampler (server defaults, sent per request by Hermes): temperature 1.0, top_p 0.95, top_k 20, presence 0

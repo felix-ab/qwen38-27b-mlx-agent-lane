@@ -1,0 +1,36 @@
+--- a/mlx_vlm/apc.py
++++ b/mlx_vlm/apc.py
+@@ -3947,6 +3947,33 @@
+     if any(len(row) != num_entries for row in row_caches):
+         return None, 0
+ 
++    # Single-row fast path (local patch, 2026-09-04 Hermes audit; env
++    # APC_EXACT_SINGLE_ROW_PLAIN=0 restores upstream behaviour). Merging one
++    # row into Batch* caches makes Qwen3.5's single-row batch-cache shortcut
++    # extract and re-merge -- i.e. copy -- the whole KV/SSM cache on every
++    # decode step (O(context) per token: 9.9 -> 6.5 tok/s at 33k tokens on an
++    # M4 Pro). With one sequence the plain single-row clone can be used as-is.
++    if (
++        len(row_caches) == 1
++        and kv_quant_config is None
++        and _env_truthy("APC_EXACT_SINGLE_ROW_PLAIN", "1")
++    ):
++        from .models.cache import ArraysCache as _ArraysCache
++
++        out_single: List[Any] = list(row_caches[0])
++        for c in out_single:
++            if isinstance(c, _ArraysCache) and getattr(c, "_left_padding", None) is not None:
++                lp = c._left_padding
++                if getattr(lp, "size", 0) == 1 and int(lp.max().item()) == 0:
++                    c._left_padding = None
++                    c._left_padding_advance = 0
++        single_targets: List[mx.array] = []
++        for c in out_single:
++            _collect_mx_arrays(c.state, single_targets)
++        if single_targets:
++            mx.eval(single_targets)
++        return out_single, int(prefix_lens[0])
++
+     out: List[Any] = []
+     for entry_idx in range(num_entries):
+         merged = _merge_exact_cache_entries(
