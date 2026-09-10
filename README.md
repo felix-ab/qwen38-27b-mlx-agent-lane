@@ -13,13 +13,18 @@ Contents:
 - `patches/`: three mlx-dspark patches and one mlx-vlm patch, with `PATCHES.md`. Also published as a
   [gist](https://gist.github.com/felix-ab/78ab16b7d15ba32432e9d8d972cd5ca9).
 
+Related on Hugging Face: our earlier (August 2026) build on a different abliterated body,
+[VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-6bit](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-6bit)
+and its [MTP drafter](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-MLX-MTP-Drafter). Their
+status sections carry the same-harness comparison to this lane and the faster serving path for that build.
+
 ## Recipe
 
 | Piece | Choice | Reason |
 |---|---|---|
-| Weights | `orcarouter/Qwen3.8-27B-Uncensored-MLX`, `6-bit/` (affine, group 64, ~22 GB, vision tower bf16) | Best published capability table among the abliterated Qwen3.8-27B bodies. On our long-session harness OrcaRouter, Heretic-ARA and stock Qwen are within two-seed noise, so no body showed an advantage. 4-bit disagrees with 6-bit on 11 % of next tokens and is not faster at agent context sizes. 8-bit leaves no room for the drafter and prefix cache in 48 GB. |
+| Weights | [`orcarouter/Qwen3.8-27B-Uncensored-MLX`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX), `6-bit/` (affine, group 64, ~22 GB, vision tower bf16) | Best published capability table among the abliterated Qwen3.8-27B bodies. On our long-session harness OrcaRouter, Heretic-ARA and stock Qwen are within two-seed noise, so no body showed an advantage. 4-bit disagrees with 6-bit on 11 % of next tokens and is not faster at agent context sizes. 8-bit leaves no room for the drafter and prefix cache in 48 GB. |
 | Precision map | uniform 6-bit | A sensitivity-driven mixed 6/8 map (315 modules at 8-bit, +2.5 GB) cut KL to the 8-bit reference by 21-56 % depending on the metric and changed nothing measurable in 40-turn retention, tool use or drift at two seeds. It cost ~6 % decode. Minima (arXiv 2609.04098) reports the same pattern: protect-GDN maps win perplexity, not tasks. |
-| Engine | mlx-dspark 0.18.1 + `incoai/Qwen3.8-27B-DFlash2` (block-diffusion drafter, lossless verify) + three patches | 15-19 tok/s end-to-end at 24-27k context on this body. mlx-vlm with the model's own MTP head: 6-7 tok/s. Plain decode is bandwidth-bound at 11-12 tok/s (22 GB over 231-273 GB/s). |
+| Engine | mlx-dspark 0.18.1 + [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) (block-diffusion drafter, lossless verify) + three patches | 15-19 tok/s end-to-end at 24-27k context on this body. mlx-vlm with the model's own MTP head: 6-7 tok/s. Plain decode is bandwidth-bound at 11-12 tok/s (22 GB over 231-273 GB/s). |
 | Draft width | `--max-draft auto` in production. Pin an integer for any A/B. | The derived width is depth-adjusted from a per-drafter calibration curve. A freshly calibrated drafter got 2 drafts per round at 24k where the stock one got 3, which turned one of our head comparisons into a width comparison until we noticed. |
 | Prefix cache | one slot, 4,096-token rungs, checkpoints persisted to disk | With 2-3 slots at 38k context the machine swapped ~1 GB during a 27k generation. One slot costs nothing for a single user. Persisted checkpoints cut a returning 24k prefill from ~240 s to ~70 s across restarts. |
 | Thinking | on, `reasoning_effort: medium`, T 1.0, top_p 0.95, top_k 20, presence 0, 4,096-token completion cap | `xhigh` produces the empty-answer-with-stop failure (Qwen3.8 issue #216, 19-38 % of turns). At `medium` we saw none in ~600 turns. Reasoning replay across turns (`reasoning_echo`) measured worse: late retention down, context doubled, speed -18 %. |
@@ -94,11 +99,12 @@ The harness plants 8 instructions and runs 40 scripted turns with tool calls (re
 
 ## Reproduction
 
-1. Download `orcarouter/Qwen3.8-27B-Uncensored-MLX` (the `6-bit/` folder; gated, accept the terms) and
-   `incoai/Qwen3.8-27B-DFlash2`.
+1. Download [`orcarouter/Qwen3.8-27B-Uncensored-MLX`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX) (the `6-bit/` folder; gated, accept the terms) and
+   [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2).
 2. `python -m venv ~/venvs/mlx-dspark && ~/venvs/mlx-dspark/bin/pip install mlx-dspark==0.18.1` (mlx 0.32.2, mlx-lm
-   0.31.3). Apply the three 0.18.1 patches from `patches/` (see `patches/PATCHES.md`; the `dflash_model` patch is for
-   0.18.0 only). Upstream reports: [prefix cache](https://github.com/ARahim3/mlx-dspark/issues/36),
+   0.31.3). Apply the three patches that apply to 0.18.1 from `patches/`: `prefix_cache` and `wide_gemm` (named 0.18.0; both
+   files are unchanged in 0.18.1 and the patches apply cleanly) and `server_cpu_split_keep` (see `patches/PATCHES.md`;
+   the `dflash_model` patch is for 0.18.0 only). Upstream reports: [prefix cache](https://github.com/ARahim3/mlx-dspark/issues/36),
    [CPU co-prefill alternative](https://github.com/ARahim3/mlx-dspark/issues/31#issuecomment-5617867067),
    [mlx-vlm exact-APC hit path](https://github.com/Blaizzy/mlx-vlm/issues/2210).
 3. `start-dspark-backend.sh dflash auto` (edit the paths at the top or set the env overrides). Health:
