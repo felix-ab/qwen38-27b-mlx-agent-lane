@@ -1,6 +1,6 @@
-# Qwen3.8-27B (uncensored) agent lane for 48-64 GB Apple Silicon
+# Qwen3.8-27B agent lane for 48-64 GB Apple Silicon
 
-Recipe, measurements and tooling for running an uncensored Qwen3.8-27B as a local agent backend (Hermes Agent in this
+Recipe, measurements and tooling for running an abliterated Qwen3.8-27B as a local agent backend (Hermes Agent in this
 case) on a 48 GB Mac mini M4 Pro. Everything here was measured on that one machine (macOS 26.6, mlx 0.32.2) with one
 harness. Where a number rests on one seed or a handful of prompts, the text says so.
 
@@ -14,8 +14,8 @@ Contents:
   [gist](https://gist.github.com/felix-ab/78ab16b7d15ba32432e9d8d972cd5ca9).
 
 Related on Hugging Face: our earlier (August 2026) build on a different abliterated body,
-[VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-6bit](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-6bit)
-and its [MTP drafter](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-MLX-MTP-Drafter). Their
+[VisualInference/Qwen3.8-27B-AEON-Ultimate-Multimodal-MLX-6bit](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Multimodal-MLX-6bit)
+and its [MTP drafter](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-MLX-MTP-Drafter). Their
 status sections carry the same-harness comparison to this lane and the faster serving path for that build.
 
 ## Recipe
@@ -77,7 +77,7 @@ The harness plants 8 instructions and runs 40 scripted turns with tool calls (re
 - KL of OrcaRouter 6-bit to stock 8-bit: 0.0075 nats, top-1 agreement 97.6 %. The abliteration accounts for 0.0053 of
   that and quantization for 0.0032. Measured on 1,820 assistant-role positions of chat-templated real sessions: a small
   sample with a consistent direction.
-- The August 2026 public build `VisualInference/Qwen3.8-27B-AEON-Ultimate-Uncensored-Multimodal-MLX-6bit` (AEON
+- The August 2026 public build `VisualInference/Qwen3.8-27B-AEON-Ultimate-Multimodal-MLX-6bit` (AEON
   trial-48, vision 6-bit), same harness, same Mac, same drafter: behaviour indistinguishable at one seed (retention 0.92
   vs 0.90, tool JSON and schema 100 % both, empties 7 % both), but KL to stock 8-bit 0.0875 with p99 1.36 and top-1
   agreement 93.4 %, against 0.0075 / 0.10 / 97.6 % for OrcaRouter 6-bit. That, the 2.5x faster text lane and budget
