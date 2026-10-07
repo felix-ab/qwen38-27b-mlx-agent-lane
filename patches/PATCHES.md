@@ -17,6 +17,14 @@ mlx-dspark 0.18.0 (unified diffs against the installed package files):
   checkpoint persistence across restarts (materialized on attach), minimum slot size, deferred file deletion,
   lazy best-slot re-attach after a CRITICAL shed
 
+- mlx-dspark-0.18.1-prefix_cache_disk_retention.patch — apply AFTER the prefix_cache patch. Keeps a bounded disk LRU of
+  checkpoints independent of the resident slot count (MLX_DSPARK_CKPT_DISK_SLOTS, default = slots, i.e. off;
+  MLX_DSPARK_CKPT_DISK_MAX_GB, default 8). Scans safetensors headers only; promotes a disk checkpoint only when it saves
+  at least 256 prefill tokens, dropping the old RAM slot first so residency stays at one; files of live or pending slots
+  are never pruned. Measured 2026-09-10 with 1 RAM slot + 3 disk files: a displaced 24.6k-token conversation returned in
+  2.55 s vs 167 s; warm turns and peak memory unchanged. Applied over stock 0.18.1 + prefix_cache, it reproduces the
+  production file byte for byte.
+
 - mlx-dspark-0.18.1-server_cpu_split_keep.patch — 0.18.1 suspends CPU co-prefill for the session on the first memory-pressure
   shed (its #31 mitigation); with the fp32 BLAS route active that crash cannot occur, so this env-gated 3-liner keeps the
   split on (MLX_DSPARK_CPU_SPLIT_SUSPEND=1 restores upstream behaviour). Validated 2026-09-10 (acceptance/speed identical).

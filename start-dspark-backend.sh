@@ -6,6 +6,9 @@
 set -euo pipefail
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export PYTHONNOUSERSITE=1
+# Disk checkpoint retention (needs the prefix_cache_disk_retention patch; ignored without it).
+export MLX_DSPARK_CKPT_DISK_SLOTS="${MLX_DSPARK_CKPT_DISK_SLOTS:-3}"
+export MLX_DSPARK_CKPT_DISK_MAX_GB="${MLX_DSPARK_CKPT_DISK_MAX_GB:-8}"
 unset PYTHONPATH PYTHONHOME
 VENV="${DSPARK_VENV:-$HOME/venvs/mlx-dspark}"
 MODEL_PATH="${DSPARK_MODEL:-$HOME/models/Qwen3.8-27B-OrcaRouter-Uncensored-MLX/6-bit}"   # orcarouter/Qwen3.8-27B-Uncensored-MLX, 6-bit/

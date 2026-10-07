@@ -1,0 +1,176 @@
+--- a/src/mlx_dspark/prefix_cache.py
++++ b/src/mlx_dspark/prefix_cache.py
+@@ -71,6 +71,7 @@
+ import threading
+ import time
+ import json
++import struct
+ import os
+ 
+ import mlx.core as mx
+@@ -289,6 +290,11 @@
+         # re-prefills in a few seconds.
+         self.min_slot_tokens = max(0, int(os.environ.get("MLX_DSPARK_CKPT_MIN_TOKENS", "1024")))
+         self._persist_lock = threading.Lock()
++        # Local opt-in: keep a bounded disk LRU independent of the resident slot count.
++        # Exact token/rung matching still decides reuse; no tensors are quantized.
++        self.disk_slots = max(self.max_slots, int(os.environ.get("MLX_DSPARK_CKPT_DISK_SLOTS", str(self.max_slots))))
++        self.disk_max_bytes = max(0, int(float(os.environ.get("MLX_DSPARK_CKPT_DISK_MAX_GB", "8")) * 1e9))
++        self.disk_hits = 0
+         self._load_thread = None
+         if self.persist_ckpt:
+             # Off the constructor's critical path: the server warms the model up while the
+@@ -309,7 +315,8 @@
+             # RAM slots are empty (fresh process before the loader ran, or a CRITICAL memory
+             # shed emptied them): bring back just the persisted slot that serves THIS prompt
+             # best, not the whole set — a critical Mac should not get 3 slots re-materialized.
+-            self._load_best_persisted(prompt_ids)
++            with self._persist_lock:
++                self._load_best_persisted(prompt_ids)
+         """Return ``(cache, ctx, reuse_len)`` for this request — the best-matching slot's
+         caches trimmed to the shared prefix, or fresh ones. A trim slot is checked out
+         (removed) until ``store()`` re-validates it; checkpoint slots are never checked out
+@@ -317,6 +324,8 @@
+         and drops any rungs a failed previous generation left pending."""
+         self._pending_rungs = {}
+         self._anchor = 0
++        if self.checkpoint_mode and self.persist_ckpt and self.disk_slots > self.max_slots:
++            self._promote_disk_match(prompt_ids)
+         best, best_len, best_rung, best_lcp = None, 0, None, 0
+         for slot in self._slots:
+             lcp = _lcp(slot.tokens, prompt_ids)
+@@ -490,7 +499,8 @@
+         if getattr(self, "persist_ckpt", False):
+             # A failed generation only desyncs in-flight RAM state; the persisted boundary
+             # checkpoints were written from settled states, so re-attach them (lazy, file-backed).
+-            self._load_persisted()
++            with self._persist_lock:
++                self._load_persisted()
+ 
+     def shed(self, level: str = "warn") -> dict:
+         """Give memory back under OS pressure (see :mod:`~mlx_dspark.memory_guard`).
+@@ -550,6 +560,7 @@
+                 "reused_tokens": self.reused_tokens,
+                 "l2": bool(self.l2_dir),
+                 "persist_ckpt": bool(getattr(self, "persist_ckpt", False)),
++                "disk_slots": self.disk_slots, "disk_hits": self.disk_hits,
+                 "min_slot_tokens": int(getattr(self, "min_slot_tokens", 0))}
+ 
+     # -- internals --
+@@ -596,7 +607,8 @@
+         for p in self._spill_paths(slot.sid):
+             with contextlib.suppress(OSError):
+                 os.remove(p)
+-        self._remove_ckpt_file(slot.sid)
++        if not (self.checkpoint_mode and self.persist_ckpt and self.disk_slots > self.max_slots):
++            self._remove_ckpt_file(slot.sid)
+ 
+     # -- persisted checkpoint slots (local patch) --
+     def _ckpt_path(self, sid: int) -> str:
+@@ -682,6 +694,28 @@
+         live = {s.sid for s in self._slots}
+         for s in self._slots:                    # files a live slot's pending persist still replaces
+             live.update(getattr(s, "superseded", ()))
++        if self.disk_slots > self.max_slots:
++            paths = sorted(glob.glob(os.path.join(self.l2_dir, "ckpt_*.safetensors")),
++                           key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
++                           reverse=True)
++            protected = []
++            optional = []
++            for path in paths:
++                m = re.fullmatch(r"ckpt_(\d+)\.safetensors", os.path.basename(path))
++                if not m:
++                    continue
++                with contextlib.suppress(OSError):
++                    n = os.path.getsize(path)
++                    (protected if int(m.group(1)) in live else optional).append((path, n))
++            kept, size = len(protected), sum(n for _, n in protected)
++            for path, n in optional:
++                if kept < self.disk_slots and (not self.disk_max_bytes or size + n <= self.disk_max_bytes):
++                    kept += 1
++                    size += n
++                else:
++                    with contextlib.suppress(OSError):
++                        os.remove(path)
++            return
+         for path in glob.glob(os.path.join(self.l2_dir, "ckpt_*.safetensors")):
+             m = re.fullmatch(r"ckpt_(\d+)\.safetensors", os.path.basename(path))
+             if m and int(m.group(1)) not in live:
+@@ -724,10 +758,15 @@
+         """Rebuild checkpoint slots from ``l2_dir`` (lazy, file-backed arrays: no RAM until a
+         hit copies them). Newest files first; anything beyond ``max_slots`` is deleted."""
+         paths = self._persisted_files() if only is None else list(only)
++        if only is None:
++            # LRU touches change mtime ordering; IDs must stay unique across every file.
++            for path in paths:
++                sid = int(os.path.basename(path)[len("ckpt_"):-len(".safetensors")])
++                self._next_sid = max(self._next_sid, sid + 1)
+         loaded = len(self._slots) if only is not None else 0
+         for path in paths:
+             if loaded >= self.max_slots:
+-                if only is None:
++                if only is None and self.disk_slots <= self.max_slots:
+                     with contextlib.suppress(OSError):
+                         os.remove(path)
+                 continue
+@@ -772,7 +811,60 @@
+         if loaded:
+             print(f"[prefix-cache] restored {loaded} persisted checkpoint slot(s) from {self.l2_dir} "
+                   f"(tokens: {[len(s.tokens) for s in self._slots]})", flush=True)
++
++    @staticmethod
++    def _checkpoint_metadata(path):
++        """Read only the safetensors header; scanning other chats allocates no tensors."""
++        with open(path, "rb") as handle:
++            header = handle.read(8)
++            if len(header) != 8:
++                raise ValueError("truncated checkpoint header")
++            n = struct.unpack("<Q", header)[0]
++            if n > 16 * 1024 * 1024:
++                raise ValueError("checkpoint header exceeds 16 MiB")
++            return json.loads(handle.read(n)).get("__metadata__", {})
+ 
++    def _usable_checkpoint(self, tokens, rungs, prompt_ids):
++        lcp = _lcp(tokens, prompt_ids)
++        if lcp >= len(tokens) and len(prompt_ids) > len(tokens):
++            return len(tokens)
++        return max((r for r in rungs if self.min_reuse <= r <= lcp and r < len(prompt_ids)), default=0)
++
++    def _promote_disk_match(self, prompt_ids):
++        """Replace one resident checkpoint only when disk avoids >=256 prefill tokens."""
++        resident = {s.sid for s in self._slots}
++        best_len = max((self._usable_checkpoint(s.tokens, s.rungs, prompt_ids)
++                        for s in self._slots if s.snapshot is not None), default=0)
++        # Synchronize with atomic publication/pruning. This also prevents reloading an
++        # incomplete snapshot or pruning the selected file while it is materialized.
++        with self._persist_lock:
++            best_path, disk_len = None, best_len
++            for path in self._persisted_files():
++                sid = int(os.path.basename(path)[len("ckpt_"):-len(".safetensors")])
++                if sid in resident:
++                    continue
++                try:
++                    meta = self._checkpoint_metadata(path)
++                    if meta.get("version") != "1":
++                        continue
++                    reuse = self._usable_checkpoint(json.loads(meta["tokens"]),
++                                                    map(int, json.loads(meta.get("rungs", "{}"))), prompt_ids)
++                    if reuse > disk_len and reuse - best_len >= 256:
++                        best_path, disk_len = path, reuse
++                except (OSError, ValueError, KeyError, TypeError):
++                    continue
++            if best_path is None:
++                return
++            # Release an old slot before loading: the disk LRU must not become extra
++            # resident snapshots on this 48 GB machine. A failed restore cold-prefills.
++            if len(self._slots) >= self.max_slots:
++                self._slots.pop()
++            self._load_persisted(only=[best_path])
++            if any(self._ckpt_path(s.sid) == best_path for s in self._slots):
++                self.disk_hits += 1
++                with contextlib.suppress(OSError):
++                    os.utime(best_path, None)
++
+     def _maybe_spill(self) -> None:
+         if self.max_ram_bytes <= 0 or not self.l2_dir:
+             return

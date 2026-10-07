@@ -26,7 +26,7 @@ Which file you want:
 | Run the fast text server | `start-dspark-backend.sh` plus the patches: [Reproduction](#reproduction), steps 1-3 |
 | Stop empty answers when thinking uses up the token cap | `thinkbudget_proxy.py` (standalone, non-streaming requests only; streaming passes through unchanged) or `thinkbudget_sidecar.py` (inside a proxy you already run; handles streaming too) |
 | Connect Hermes Agent | `hermes-provider.yaml` |
-| See what each patch changes and which mlx-dspark version it applies to | [`patches/PATCHES.md`](patches/PATCHES.md): four mlx-dspark patches (three apply to 0.18.1) and one mlx-vlm patch, also as a [gist](https://gist.github.com/felix-ab/78ab16b7d15ba32432e9d8d972cd5ca9) |
+| See what each patch changes and which mlx-dspark version it applies to | [`patches/PATCHES.md`](patches/PATCHES.md): five mlx-dspark patches (four apply to 0.18.1) and one mlx-vlm patch, also as a [gist](https://gist.github.com/felix-ab/78ab16b7d15ba32432e9d8d972cd5ca9) |
 | Know why each setting was chosen | [Recipe](#recipe), [Speed](#speed), [What did not help](#what-did-not-help) |
 
 ## How we got here
@@ -49,9 +49,9 @@ session (a 30.5k-token prompt). The hardware was near its ceilings (decode ~11 t
 7. Prefix-cache persistence fixes (`prefix_cache` patch): re-prefill after a new day or a memory edit 130-260 s to
    2-12 s.
 8. Budget forcing (`thinkbudget_*`) with thinking at `medium`: empty answers at the token cap 1 in 60 turns to 0 in 90.
-9. mlx-dspark 0.18.1 with one RAM cache slot, since two or three slots caused swapping. A later local patch that keeps
-   up to three extra checkpoints on disk brought a 24.6k-token conversation back in 2.55 s instead of 167 s; that
-   patch is not published here yet.
+9. mlx-dspark 0.18.1 with one RAM cache slot, since two or three slots caused swapping, plus up to three checkpoints
+   kept on disk (`prefix_cache_disk_retention` patch, 8 GB soft budget). A 24.6k-token conversation pushed out of RAM
+   came back in 2.55 s instead of 167 s.
 
 Related on Hugging Face: our earlier (August 2026) build on a different abliterated body,
 [VisualInference/Qwen3.8-27B-AEON-Ultimate-Multimodal-MLX-6bit](https://huggingface.co/VisualInference/Qwen3.8-27B-AEON-Ultimate-Multimodal-MLX-6bit)
@@ -66,7 +66,7 @@ status sections carry the same-harness comparison to this lane and the faster se
 | Precision map | uniform 6-bit | A sensitivity-driven mixed 6/8 map (315 modules at 8-bit, +2.5 GB) cut KL to the 8-bit reference by 21-56 % depending on the metric and changed nothing measurable in 40-turn retention, tool use or drift at two seeds. It cost ~6 % decode. Minima (arXiv 2609.04098) reports the same pattern: protect-GDN maps win perplexity, not tasks. |
 | Engine | mlx-dspark 0.18.1 + [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) (block-diffusion drafter, lossless verify) + three patches | 15-19 tok/s end-to-end at 24-27k context on this body. mlx-vlm with the model's own MTP head: 6-7 tok/s. Plain decode is bandwidth-bound at 11-12 tok/s (22 GB over 231-273 GB/s). |
 | Draft width | `--max-draft auto` in production. Pin an integer for any A/B. | The derived width is depth-adjusted from a per-drafter calibration curve. A freshly calibrated drafter got 2 drafts per round at 24k where the stock one got 3, which turned one of our head comparisons into a width comparison until we noticed. |
-| Prefix cache | one slot, 4,096-token rungs, checkpoints persisted to disk | With 2-3 slots at 38k context the machine swapped ~1 GB during a 27k generation. One slot costs nothing for a single user. Persisted checkpoints cut a returning 24k prefill from ~240 s to ~70 s across restarts. |
+| Prefix cache | one slot, 4,096-token rungs, checkpoints persisted to disk | With 2-3 slots at 38k context the machine swapped ~1 GB during a 27k generation. One slot costs nothing for a single user. Persisted checkpoints cut a returning 24k prefill from ~240 s to ~70 s across restarts. With the disk-retention patch, up to three checkpoints stay on disk (8 GB soft budget) while only one is resident; a displaced 24.6k conversation returned in 2.55 s instead of 167 s. |
 | Thinking | on, `reasoning_effort: medium`, T 1.0, top_p 0.95, top_k 20, presence 0, 4,096-token completion cap | `xhigh` produces the empty-answer-with-stop failure (Qwen3.8 issue #216, 19-38 % of turns). At `medium` we saw none in ~600 turns. Reasoning replay across turns (`reasoning_echo`) measured worse: late retention down, context doubled, speed -18 %. |
 | Budget forcing | `thinkbudget_proxy.py` or `thinkbudget_sidecar.py` | At the 4,096 cap, 1 of 60 open-ended turns ended inside `<think>` with no answer across two seeds; at 2,048, 4 of 30. When a turn ends with `finish_reason=length` inside the think block, the proxy re-renders the prompt, appends the partial reasoning and `</think>`, and continues on `/v1/completions` for up to 2,048 answer tokens. The shared prefix hits the cache. With the proxy: 0 of 90 turns. Unaffected requests pass through unchanged (131 checked byte for byte). |
 
@@ -142,9 +142,9 @@ The harness plants 8 instructions and runs 40 scripted turns with tool calls (re
 1. Download [`orcarouter/Qwen3.8-27B-Uncensored-MLX`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX) (the `6-bit/` folder; gated, accept the terms) and
    [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2).
 2. `python -m venv ~/venvs/mlx-dspark && ~/venvs/mlx-dspark/bin/pip install mlx-dspark==0.18.1` (mlx 0.32.2, mlx-lm
-   0.31.3). Apply the three patches that apply to 0.18.1 from `patches/`: `prefix_cache` and `wide_gemm` (named 0.18.0; both
-   files are unchanged in 0.18.1 and the patches apply cleanly) and `server_cpu_split_keep` (see `patches/PATCHES.md`;
-   the `dflash_model` patch is for 0.18.0 only). Upstream reports: [prefix cache](https://github.com/ARahim3/mlx-dspark/issues/36),
+   0.31.3). Apply the four patches that apply to 0.18.1 from `patches/`: `prefix_cache` and `wide_gemm` (named 0.18.0; both
+   files are unchanged in 0.18.1 and the patches apply cleanly), then `prefix_cache_disk_retention` on top of
+   `prefix_cache`, and `server_cpu_split_keep` (see `patches/PATCHES.md`; the `dflash_model` patch is for 0.18.0 only). Upstream reports: [prefix cache](https://github.com/ARahim3/mlx-dspark/issues/36),
    [CPU co-prefill alternative](https://github.com/ARahim3/mlx-dspark/issues/31#issuecomment-5617867067),
    [mlx-vlm exact-APC hit path](https://github.com/Blaizzy/mlx-vlm/issues/2210).
 3. `start-dspark-backend.sh dflash auto` (edit the paths at the top or set the env overrides). Health:
