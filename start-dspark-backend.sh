@@ -1,5 +1,5 @@
 #!/bin/bash
-# Text lane launcher: mlx-dspark 0.18.0 (lossless speculative decoding) + the incoai DFlash2 drafter serving a 6-bit
+# Text lane launcher: mlx-dspark 0.18.1 (0.18.0 also works; lossless speculative decoding) + the incoai DFlash2 drafter serving a 6-bit
 # OrcaRouter Qwen3.8-27B checkpoint on 127.0.0.1:8044. Sanitized template of the production launcher (2026-09-09).
 # Env overrides: DSPARK_VENV DSPARK_MODEL DSPARK_DRAFTER DSPARK_SLOTS DSPARK_RUNGS DSPARK_PREFIX_CACHE_DIR DSPARK_CPU_SPLIT BACKEND_PORT
 # Usage: start-dspark-backend.sh [dflash|dspark|lookup|baseline] [auto|<int>|derived]

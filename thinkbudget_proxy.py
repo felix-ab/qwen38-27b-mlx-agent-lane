@@ -8,7 +8,8 @@ budget splice ("Considering the limited time by the user, I have to give the sol
 now.") and a closed </think>, and continue with /v1/completions for ANSWER_BUDGET tokens. The shared prefix hits
 mlx-dspark's prefix cache, so pass 2 costs roughly one answer's worth of decode. Tool calls in pass 2 are parsed
 from Qwen's <tool_call><function=...> XML back into OpenAI tool_calls.
-Usage: thinkbudget_proxy.py --upstream http://127.0.0.1:18044 --port 18045 --model-dir <dir> [--think-budget 2048] [--answer-budget 1536]
+Usage: thinkbudget_proxy.py --upstream http://127.0.0.1:8044 --port 8084 --model-dir <dir> [--think-budget 4096] [--answer-budget 2048]
+Defaults match the measured production settings; streaming requests pass through without budget forcing.
 """
 import argparse, json, re, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -83,8 +84,8 @@ class H(BaseHTTPRequestHandler):
                "thinkbudget": {"pass1_secs": round(time.perf_counter() - t0, 1), "think_budget": p1["max_tokens"], "answer_budget": a.answer_budget}}
         self._send(200, out)
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--upstream", default="http://127.0.0.1:18044"); ap.add_argument("--port", type=int, default=18045)
-    ap.add_argument("--model-dir", required=True); ap.add_argument("--think-budget", type=int, default=2048); ap.add_argument("--answer-budget", type=int, default=1536); ap.add_argument("--splice-mode", choices=list(SPLICES), default="sentence")
+    ap = argparse.ArgumentParser(); ap.add_argument("--upstream", default="http://127.0.0.1:8044"); ap.add_argument("--port", type=int, default=8084)
+    ap.add_argument("--model-dir", required=True); ap.add_argument("--think-budget", type=int, default=4096); ap.add_argument("--answer-budget", type=int, default=2048); ap.add_argument("--splice-mode", choices=list(SPLICES), default="sentence")
     a = ap.parse_args(); SPLICE = SPLICES[a.splice_mode]
     from transformers import AutoTokenizer; tok = AutoTokenizer.from_pretrained(a.model_dir)
     print(f"thinkbudget proxy on :{a.port} -> {a.upstream} (think {a.think_budget}, answer {a.answer_budget})", flush=True)
